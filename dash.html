@@ -1,0 +1,1436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>F1 Live Telemetry Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js">
+// ── Distance normalization ──────────────────────────────────────────────────
+function buildDistArray(tel){
+  // Returns array of cumulative distances (metres) matching tel indices
+  const dist=[0];
+  for(let i=1;i<tel.length;i++){
+    const dt=(new Date(tel[i].date)-new Date(tel[i-1].date))/1000;
+    const spd=(tel[i].speed||0)*1000/3600; // km/h → m/s
+    dist.push(dist[i-1]+spd*dt);
+  }
+  return dist;
+}
+
+function resampleByDistance(tel,dist,targetDist){
+  // Interpolate a telemetry value array onto a uniform distance grid
+  const result=[];
+  const keys=['speed','throttle','brake','n_gear','rpm'];
+  const total=targetDist.length;
+  let j=0;
+  for(let i=0;i<total;i++){
+    const d=targetDist[i];
+    while(j<dist.length-2&&dist[j+1]<d)j++;
+    const d0=dist[j],d1=dist[j+1]||d0;
+    const t=d1>d0?(d-d0)/(d1-d0):0;
+    const frame={};
+    keys.forEach(k=>{
+      const v0=tel[j]?.[k]??0;
+      const v1=tel[j+1]?.[k]??v0;
+      frame[k]=v0+(v1-v0)*t;
+    });
+    result.push(frame);
+  }
+  return result;
+}
+
+// ── Telemetry Snapshot ───────────────────────────────────────────────────────
+function triggerSnapshot(elapsedSec){
+  if(!S.telData?.lap?.date_start || !S.telData?.tel?.length) return;
+  const lapStart=new Date(S.telData.lap.date_start).getTime();
+  const targetMs=lapStart+elapsedSec*1000;
+  const tel=S.telData.tel;
+  // Find index closest to target time
+  let best=0,bestDiff=Infinity;
+  tel.forEach((f,i)=>{
+    const diff=Math.abs(new Date(f.date).getTime()-targetMs);
+    if(diff<bestDiff){bestDiff=diff;best=i;}
+  });
+  // Build a ±2.5s window
+  const windowMs=2500;
+  const t0=new Date(tel[best].date).getTime()-windowMs;
+  const t1=new Date(tel[best].date).getTime()+windowMs;
+  let start=best,end=best;
+  for(let i=best;i>=0;i--){if(new Date(tel[i].date).getTime()<t0){start=i;break;}}
+  for(let i=best;i<tel.length;i++){if(new Date(tel[i].date).getTime()>t1){end=i;break;}}
+  S.customZoom=null;S.zoomSector=null;S.zoomSector2=null;
+  // Inject as a virtual custom zoom by overriding getActiveBounds for this render
+  S._snapBounds={start,end};
+  $('bresetzoom').style.display='inline-block';
+  document.querySelectorAll('.sec-btn').forEach(el=>{el.classList.remove('act');el.classList.remove('act2');});
+  S.scrubIdx=best;$('tscrub').value=best;
+  renderChart();
+  drawTrack(S.telData.loc,S.telData.tel,best);
+}
+
+// ── Track map hover ──────────────────────────────────────────────────────────
+(function initTrackHover(){
+  const canvas=$('tcanv');
+  const tip=$('tcanv-tip');
+  let _loc=null,_tel=null,_txFn=null,_tyFn=null;
+
+  // Called by drawTrack to register coordinate transforms
+  window._registerTrackTransform=function(loc,tel,txFn,tyFn){
+    _loc=loc;_tel=tel;_txFn=txFn;_tyFn=tyFn;
+  };
+
+  canvas.addEventListener('mousemove',e=>{
+    if(!_loc||!_tel)return;
+    const rect=canvas.getBoundingClientRect();
+    const mx=e.clientX-rect.left, my=e.clientY-rect.top;
+    // Find nearest loc point in canvas space
+    let best=-1,bestD=Infinity;
+    const step=Math.max(1,Math.floor(_loc.length/600)); // sample for perf
+    for(let i=0;i<_loc.length;i+=step){
+      const px=_txFn(_loc[i].x), py=_tyFn(_loc[i].y);
+      const d=(mx-px)**2+(my-py)**2;
+      if(d<bestD){bestD=d;best=i;}
+    }
+    if(bestD>600||best<0){tip.style.display='none';S.hoverIdx=-1;updateChartIndicator();return;}
+    // Map loc index → tel index by time
+    const locTime=new Date(_loc[best].date).getTime();
+    let telBest=0,telBestD=Infinity;
+    _tel.forEach((f,i)=>{
+      const d=Math.abs(new Date(f.date).getTime()-locTime);
+      if(d<telBestD){telBestD=d;telBest=i;}
+    });
+    S.hoverIdx=telBest;
+    updateChartIndicator();
+    // Tooltip
+    const frame=_tel[telBest]||{};
+    tip.innerHTML=`<b>${frame.speed??'—'}</b> km/h &nbsp; G<b>${frame.n_gear??'—'}</b> &nbsp; T<b>${frame.throttle??'—'}</b>%`;
+    // Position tooltip, keep inside canvas
+    const tw=tip.offsetWidth||110, th=tip.offsetHeight||32;
+    let tx=mx+12, ty=my-th-6;
+    if(tx+tw>canvas.width)tx=mx-tw-8;
+    if(ty<0)ty=my+10;
+    tip.style.left=tx+'px';tip.style.top=ty+'px';
+    tip.style.display='block';
+  });
+
+  canvas.addEventListener('mouseleave',()=>{
+    tip.style.display='none';
+    S.hoverIdx=-1;
+    updateChartIndicator();
+  });
+
+  // Click: if near a pin trigger snapshot, else move scrubber
+  canvas.addEventListener('click',e=>{
+    if(!S.rcPins||!S.rcPins.length)return;
+    const rect=canvas.getBoundingClientRect();
+    const mx=e.clientX-rect.left, my=e.clientY-rect.top;
+    let hit=null,hitD=Infinity;
+    S.rcPins.forEach(pin=>{
+      const d=(mx-pin.px)**2+(my-pin.py)**2;
+      if(d<hitD){hitD=d;hit=pin;}
+    });
+    if(hit&&hitD<225){ // within ~15px
+      // Find lap-elapsed time for this event
+      if(!S.telData?.lap?.date_start)return;
+      const lapStart=new Date(S.telData.lap.date_start).getTime();
+      const evMs=new Date(hit.ev.date).getTime();
+      const elapsed=(evMs-lapStart)/1000;
+      if(elapsed>=0&&elapsed<=((S.telData.lap.lap_duration||120)+5)){
+        triggerSnapshot(elapsed);
+        // Flash the pin
+        const c=canvas.getContext('2d');
+        c.beginPath();c.arc(hit.px,hit.py,16,0,Math.PI*2);
+        c.strokeStyle=hit.fill;c.lineWidth=2;
+        c.setLineDash([4,3]);c.stroke();c.setLineDash([]);
+      }
+    }
+  });
+
+  // Hover: show pin tooltip if hovering over a pin (override track tooltip)
+  canvas.addEventListener('mousemove',e=>{
+    if(!S.rcPins||!S.rcPins.length)return;
+    const rect=canvas.getBoundingClientRect();
+    const mx=e.clientX-rect.left, my=e.clientY-rect.top;
+    let hit=null,hitD=Infinity;
+    S.rcPins.forEach(pin=>{
+      const d=(mx-pin.px)**2+(my-pin.py)**2;
+      if(d<hitD){hitD=d;hit=pin;}
+    });
+    if(hit&&hitD<225){
+      const msg=hit.ev.message||(hit.ev.flag?'Flag: '+hit.ev.flag:hit.ev.safety_car?'Safety car':'Event');
+      const short=msg.length>48?msg.slice(0,48)+'…':msg;
+      tip.innerHTML=`<span style="color:${hit.fill};font-weight:bold">${hit.label}</span>&nbsp; ${short}<br><span style="color:#6a6a88;font-size:9px">click to snap telemetry</span>`;
+      const tw=tip.offsetWidth||160,th=tip.offsetHeight||38;
+      let ttx=hit.px+14,tty=hit.py-th-8;
+      if(ttx+tw>canvas.width)ttx=hit.px-tw-10;
+      if(tty<0)tty=hit.py+14;
+      tip.style.left=ttx+'px';tip.style.top=tty+'px';
+      tip.style.display='block';
+      canvas.style.cursor='pointer';
+    } else {
+      canvas.style.cursor='';
+    }
+  },true); // capture phase so it runs before the existing mousemove
+})();
+
+</script>
+<style>
+:root {
+  --bg:#07070f; --surface:#0e0e1c; --surface2:#141426; --border:#1e1e35; --border2:#2a2a48;
+  --text:#e8e8f4; --muted:#6a6a88; --accent:#e8002d; --accent2:#ff8700;
+  --green:#00e676; --cyan:#00cfff; --yellow:#ffcc00; --font:'Fira Code','Consolas','Courier New',monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:13px;min-height:100vh;overflow:hidden}
+#topbar{display:flex;align-items:center;gap:12px;padding:0 16px;height:48px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:100;flex-wrap:nowrap}
+.logo{color:var(--accent);font-size:16px;font-weight:900;letter-spacing:3px;white-space:nowrap}
+.logo span{color:var(--text)}
+.sep{width:1px;height:22px;background:var(--border2);flex-shrink:0}
+#controls{display:flex;align-items:center;gap:8px;flex:1;flex-wrap:nowrap;min-width:0;overflow-x:auto}
+select,button{background:var(--surface2);color:var(--text);border:1px solid var(--border2);border-radius:5px;padding:5px 9px;font-family:var(--font);font-size:11px;cursor:pointer;outline:none;transition:border-color 0.15s;white-space:nowrap;flex-shrink:0}
+select:hover,select:focus{border-color:var(--accent)}
+select option{background:#111}
+.btn-go{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:900;padding:5px 14px;letter-spacing:1px}
+.btn-go:hover{background:#bf001f}
+.btn-live{border-color:var(--green);color:var(--green);font-weight:700;padding:5px 12px}
+.btn-live.on{background:rgba(0,230,118,0.1)}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green);margin-right:5px;animation:pulse 1.2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.25}}
+#statusbar{display:flex;align-items:center;gap:16px;padding:4px 16px;background:var(--surface);border-bottom:1px solid var(--border);font-size:10px;color:var(--muted);flex-wrap:wrap}
+.sv{color:var(--text);font-weight:700}
+.sv.g{color:var(--green)}.sv.r{color:var(--accent)}.sv.o{color:var(--accent2)}.sv.c{color:var(--cyan)}
+#layout{display:grid;grid-template-columns:300px 1fr;height:calc(100vh - 82px)}
+#left{border-right:1px solid var(--border);display:flex;flex-direction:column;background:var(--surface);overflow:hidden}
+#left h2{padding:10px 14px;font-size:10px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;border-bottom:1px solid var(--border);flex-shrink:0}
+#dlist{flex:1;overflow-y:auto;padding:6px;display:flex;flex-direction:column;gap:3px}
+.dc{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:7px;border:1px solid transparent;cursor:pointer;transition:all 0.12s;user-select:none}
+.dc:hover{background:var(--surface2);border-color:var(--border2)}
+.dc.sel{background:rgba(232,0,45,0.08);border-color:rgba(232,0,45,0.35)}
+.dc.sel2{background:rgba(255,135,0,0.08);border-color:rgba(255,135,0,0.35)}
+.dd{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+.dnum{width:22px;font-size:10px;color:var(--muted);text-align:right;flex-shrink:0}
+.dname{flex:1;font-weight:700;font-size:12px}
+.dteam{font-size:9px;color:var(--muted);transition:color 0.15s;display:inline-block}
+.dteam:hover{color:var(--cyan);text-decoration:underline}
+.dlt{font-size:10px;color:var(--cyan)}
+.dgap{font-size:9px;color:var(--muted)}
+.dpos{width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;background:var(--surface2);flex-shrink:0}
+#right{display:grid;grid-template-rows:auto 1fr;overflow:hidden}
+#row1{display:grid;grid-template-columns:1fr 1fr 1fr;border-bottom:1px solid var(--border)}
+#row2{display:grid;grid-template-columns:1fr 1fr;overflow:hidden}
+.panel{border-right:1px solid var(--border);padding:12px 14px;display:flex;flex-direction:column;gap:9px;overflow:hidden;background:var(--bg)}
+.panel:last-child{border-right:none}
+.ph{font-size:10px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;flex-shrink:0}
+.mg{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.mc{background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:9px 11px}
+.ml{font-size:9px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;margin-bottom:3px}
+.mv{font-size:20px;font-weight:700;line-height:1}
+.ms{font-size:9px;color:var(--muted);margin-top:2px}
+.mv.g{color:var(--green)}.mv.r{color:var(--accent)}.mv.o{color:var(--accent2)}.mv.c{color:var(--cyan)}.mv.y{color:var(--yellow)}
+.tyre-row{display:flex;align-items:center;gap:11px}
+.tc{width:50px;height:50px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:19px;font-weight:900;flex-shrink:0;border:3px solid #333;transition:all 0.3s}
+.ti{flex:1}
+.tcn{font-size:13px;font-weight:700;margin-bottom:3px}
+.tbw{height:5px;background:var(--border2);border-radius:3px;overflow:hidden;margin-bottom:3px}
+.tb{height:100%;border-radius:3px;transition:width 0.4s}
+.ta{font-size:9px;color:var(--muted)}
+.drs-on{display:inline-block;background:rgba(0,230,118,0.13);color:var(--green);border:1px solid rgba(0,230,118,0.4);border-radius:4px;padding:2px 7px;font-size:10px;font-weight:700}
+.drs-off{display:inline-block;background:var(--surface2);color:var(--muted);border:1px solid var(--border2);border-radius:4px;padding:2px 7px;font-size:10px}
+#track-panel{border-right:1px solid var(--border);border-top:1px solid var(--border)}
+.lap-nav{display:flex;align-items:center;gap:5px}
+.lap-nav button{padding:3px 9px;font-size:10px}
+.lap-nav button:hover{border-color:var(--accent);color:var(--accent)}
+.lap-nav span{font-size:10px;color:var(--muted);white-space:nowrap}
+#lapInput{width:28px;background:transparent;border:none;border-bottom:1px solid var(--border2);color:var(--text);font-family:var(--font);font-size:10px;text-align:center;outline:none;padding:1px 2px}
+#lapInput:focus{border-bottom-color:var(--accent)}
+#lapTotal{font-size:10px;color:var(--muted)}
+#tmap{position:relative;flex:1;min-height:0}
+#tmap canvas{position:absolute;inset:0;width:100%;height:100%}
+.scrub-container{padding:6px 0 2px 0;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-shrink:0}
+.scrub-container input[type=range]{flex:1;background:var(--surface2);height:5px;border-radius:3px;appearance:none;outline:none;cursor:pointer}
+.scrub-container input[type=range]::-webkit-slider-thumb{appearance:none;width:12px;height:12px;border-radius:50%;background:var(--accent);transition:transform 0.1s}
+.scrub-container input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.25)}
+.scrub-time{font-size:10px;color:var(--muted);font-family:monospace;min-width:45px;text-align:right}
+.empty-msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:11px;flex-direction:column;gap:6px;pointer-events:none}
+#rright{display:flex;flex-direction:column;border-top:1px solid var(--border);overflow:hidden}
+.rright-top{flex:0 0 55%;border-bottom:1px solid var(--border);display:flex;flex-direction:column;padding:12px 14px;gap:8px;overflow:hidden}
+.rright-bot{flex:1;display:flex;flex-direction:column;padding:12px 14px;gap:8px;overflow:hidden}
+.chart-hdr{display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.cw{position:relative;flex:1;min-height:0;cursor:crosshair}
+.cw canvas{position:absolute;inset:0}
+#ltable{overflow-y:auto;flex:1}
+table{width:100%;border-collapse:collapse;font-size:10px}
+th{font-size:9px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;padding:3px 7px;border-bottom:1px solid var(--border);text-align:left;position:sticky;top:0;background:var(--bg)}
+td{padding:4px 7px;border-bottom:1px solid var(--border)}
+tr.best td{color:var(--green)}
+tr.cur td{background:rgba(232,0,45,0.05)}
+
+/* Sector Zoom & Chart Controls Styles */
+.sec-btn{font-size:11px;padding:3px 7px;border-radius:4px;cursor:pointer;border:1px solid transparent;transition:all 0.15s;user-select:none;background:var(--surface2)}
+.sec-btn:hover{background:var(--surface2);border-color:var(--accent)}
+.sec-btn.act{background:rgba(0,207,255,0.15);border-color:var(--cyan)}
+.sec-btn.act2{background:rgba(255,135,0,0.15);border-color:var(--accent2)}
+
+/* Snapshot input */
+#snapInput{width:54px;background:var(--surface2);border:1px solid var(--border2);color:var(--text);font-family:monospace;font-size:10px;text-align:center;padding:2px 4px;border-radius:4px;outline:none}
+#snapInput:focus{border-color:var(--accent)}
+#snapBtn{font-size:10px;padding:3px 7px;border-radius:4px;cursor:pointer;border:1px solid var(--border2);background:var(--surface2);color:var(--accent);transition:all .15s}
+#snapBtn:hover{border-color:var(--accent);background:rgba(0,207,255,.12)}
+
+/* Distance-norm toggle */
+.dist-toggle-wrap{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--muted);cursor:pointer;user-select:none}
+.toggle-sw{width:28px;height:14px;border-radius:7px;background:var(--surface2);border:1px solid var(--border2);position:relative;transition:background .2s;flex-shrink:0;cursor:pointer}
+.toggle-sw.on{background:rgba(0,207,255,.35);border-color:var(--accent)}
+.toggle-sw::after{content:'';position:absolute;top:2px;left:2px;width:8px;height:8px;border-radius:50%;background:var(--muted);transition:transform .2s,background .2s}
+.toggle-sw.on::after{transform:translateX(14px);background:var(--accent)}
+
+/* Track hover tooltip */
+#tcanv-tip{position:absolute;pointer-events:none;display:none;background:rgba(10,10,22,.92);border:1px solid var(--border2);border-radius:6px;padding:5px 8px;font-size:10px;font-family:monospace;color:var(--text);white-space:nowrap;z-index:10}
+
+/* Hover line on chart (drawn via plugin) */
+.slbl{color:var(--muted)}
+.sval{color:var(--cyan);font-weight:700}
+
+#drag-box{position:absolute;background:rgba(0,207,255,0.15);border:1px dashed var(--cyan);top:0;bottom:0;display:none;pointer-events:none}
+
+::-webkit-scrollbar{width:3px;height:3px}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+#overlay{position:fixed;inset:0;background:rgba(7,7,15,0.9);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:999;gap:14px}
+#overlay.h{display:none}
+.spin{width:32px;height:32px;border:2.5px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin 0.7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+#overlay p{color:var(--muted);font-size:11px}
+#overlay b{color:var(--text)}
+</style>
+</head>
+<body>
+
+<div id="overlay">
+  <div class="spin"></div>
+  <p><b id="otxt">Initialising F1 Dashboard</b></p>
+  <p id="osub">Connecting to OpenF1 API…</p>
+</div>
+
+<div id="topbar">
+  <div class="logo">F1<span>HUB</span></div>
+  <div class="sep"></div>
+  <div id="controls">
+    <select id="sy" title="Year"></select>
+    <select id="se" title="Event"><option>— year —</option></select>
+    <select id="ss" title="Session"><option>— event —</option></select>
+    <button class="btn-go" id="bload">LOAD</button>
+    <div class="sep"></div>
+    <button class="btn-live" id="blive" title="Auto-refresh every 7s during live sessions"><span class="dot"></span>LIVE</button>
+  </div>
+</div>
+
+<div id="statusbar">
+  <span>SESSION <span class="sv" id="st0">—</span></span>
+  <span>CIRCUIT <span class="sv" id="st1">—</span></span>
+  <span>LAP <span class="sv c" id="st2">—</span></span>
+  <span>LEADER <span class="sv g" id="st3">—</span></span>
+  <span>DRIVER <span class="sv o" id="st4">—</span></span>
+  <span style="margin-left:auto">UPDATED <span class="sv" id="st5">—</span></span>
+</div>
+
+<div id="layout">
+  <div id="left">
+    <h2>Drivers — select to analyse</h2>
+    <div id="dlist"><div class="empty-msg" style="position:static;padding:20px">Load a session</div></div>
+  </div>
+
+  <div id="right">
+    <div id="row1">
+      <div class="panel">
+        <div class="ph">Live Telemetry</div>
+        <div class="mg">
+          <div class="mc"><div class="ml">Speed</div><div class="mv c" id="ms">—</div><div class="ms">km/h</div></div>
+          <div class="mc"><div class="ml">Top Speed</div><div class="mv o" id="mts">—</div><div class="ms">this lap</div></div>
+          <div class="mc"><div class="ml">Throttle</div><div class="mv g" id="mt">—</div><div class="ms">%</div></div>
+          <div class="mc"><div class="ml">Active Aero</div><div id="mb" class="drs-off">OFF</div></div>
+        </div>
+        <div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap">
+          <span style="font-size:9px;color:var(--muted)">DRS</span><span id="mdrs" class="drs-off">OFF</span>
+          <span style="font-size:9px;color:var(--muted);margin-left:6px">GEAR</span><span style="font-size:17px;font-weight:900" id="mg2">—</span>
+          <span style="font-size:9px;color:var(--muted);margin-left:6px">RPM</span><span style="font-size:11px;color:var(--yellow);font-weight:700" id="mrpm">—</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="ph">Tyre Status</div>
+        <div class="tyre-row">
+          <div class="tc" id="tcirc">?</div>
+          <div class="ti">
+            <div class="tcn" id="tcmpd">—</div>
+            <div class="tbw"><div class="tb" id="tbar" style="width:0%;background:var(--muted)"></div></div>
+            <div class="ta" id="tage">Load a session</div>
+          </div>
+        </div>
+        <div class="mg">
+          <div class="mc"><div class="ml">Stint Age</div><div class="mv y" id="mta">—</div><div class="ms">laps on tyre</div></div>
+          <div class="mc"><div class="ml">Pit Stops</div><div class="mv" id="mps">—</div><div class="ms">this race</div></div>
+        </div>
+      </div>
+
+      <div class="panel" style="border-right:none">
+        <div class="ph">Timing & Position</div>
+        <div class="mg">
+          <div class="mc"><div class="ml">Last Lap</div><div class="mv c" id="mll" style="font-size:14px">—</div></div>
+          <div class="mc"><div class="ml">Best Lap</div><div class="mv g" id="mbl" style="font-size:14px">—</div></div>
+          <div class="mc"><div class="ml">Position</div><div class="mv" id="mpos">—</div></div>
+          <div class="mc"><div class="ml">Gap / Lead</div><div class="mv o" id="mgap" style="font-size:14px">—</div></div>
+        </div>
+        <div class="mc" style="margin-top:0">
+          <div class="ml">Sector Times (Click to Zoom)</div>
+          <div style="display:flex;gap:8px;margin-top:3px">
+            <div class="sec-btn" id="ms1-btn" title="Click: Sector 1 | Shift+Click: add Sector 2"><span class="slbl">S1 </span><span id="ms1" class="sval">—</span></div>
+            <div class="sec-btn" id="ms2-btn" title="Click: Sector 2 | Shift+Click: add Sector 1 or 3"><span class="slbl">S2 </span><span id="ms2" class="sval">—</span></div>
+            <div class="sec-btn" id="ms3-btn" title="Click: Sector 3 | Shift+Click: add Sector 2"><span class="slbl">S3 </span><span id="ms3" class="sval">—</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="row2">
+      <div class="panel" id="track-panel">
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-shrink:0">
+          <div class="ph">Track Map</div>
+          <div class="lap-nav">
+            <button id="bprev">&#9664;</button>
+            <input id="lapInput" value="—" title="Type a lap number"><span id="lapTotal"> / —</span>
+            <button id="bnext">&#9654;</button>
+          </div>
+        </div>
+        <div id="tmap">
+          <canvas id="tcanv"></canvas>
+          <div class="empty-msg" id="tempty">Select a driver</div>
+          <div id="tcanv-tip"></div>
+        </div>
+        <div class="scrub-container">
+          <span style="font-size:9px;color:var(--muted)">SCRUB</span>
+          <input type="range" id="tscrub" min="0" value="0" step="1">
+          <span class="scrub-time" id="tscrub-val">00.0s</span>
+        </div>
+      </div>
+
+      <div id="rright">
+        <div class="rright-top">
+          <div class="chart-hdr">
+            <span class="ph" id="ctitle">Speed Trace</span>
+            <div style="display:flex;gap:6px;align-items:center">
+              <select id="schart" style="font-size:10px;padding:3px 6px">
+                <option value="speed">Speed</option>
+                <option value="throttle">Throttle</option>
+                <option value="brake">Brake</option>
+                <option value="gear">Gear</option>
+                <option value="rpm">RPM</option>
+                <option value="laptimes">Lap Times</option>
+              </select>
+              <button id="bresetzoom" class="sec-btn" style="display:none;color:var(--accent)">RESET ZOOM</button>
+              <input id="snapInput" placeholder="0.0s" title="Lap elapsed time (e.g. 23.4s) for 5s snapshot">
+              <button id="snapBtn" title="Zoom chart to ±2.5s around entered time">⚡ SNAP</button>
+              <div class="dist-toggle-wrap" id="distToggleWrap" title="Align drivers by distance instead of time">
+                <div class="toggle-sw" id="distToggle"></div>
+                <span>DIST NORM</span>
+              </div>
+            </div>
+          </div>
+          <div class="cw" id="cw">
+            <canvas id="tchart" role="img" aria-label="F1 telemetry chart">Telemetry data</canvas>
+            <div id="drag-box"></div>
+          </div>
+        </div>
+        <div class="rright-bot">
+          <div class="ph">Lap History</div>
+          <div id="ltable"><div class="empty-msg" style="position:static;padding:12px;text-align:center;color:var(--muted)">No data</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API='https://corsproxy.io/?url=https://api.openf1.org/v1';
+const TC={'Red Bull Racing':'#1e41ff','Ferrari':'#e8002d','Mercedes':'#00a19c','McLaren':'#ff8700','Aston Martin':'#006f62','Alpine':'#0078c1','Williams':'#005aff','RB':'#4e7cff','Kick Sauber':'#52e252','Sauber':'#52e252','Haas F1 Team':'#b6babd','Haas':'#b6babd','Audi':'#f50a3a'};
+const TY={'SOFT':'#e8002d','MEDIUM':'#ffcc00','HARD':'#e8e8e8','INTERMEDIATE':'#00c853','WET':'#1565c0'};
+
+let S={
+  sessionKey:null, driverNum:null, driverNum2:null, 
+  laps:[], lapIdx:0, drivers:{}, positions:{}, intervals:{}, stints:{}, pits:{}, allLaps:{}, 
+  telemChart:null, liveInt:null, isLive:false, 
+  telData:null, telData2:null, scrubIdx:0, zoomSector:null, zoomSector2:null, customZoom:null, hoverIdx:-1, distNorm:false, raceControl:[], rcPins:[]
+};
+
+const $=id=>document.getElementById(id);
+function fl(s){if(!s||isNaN(s))return'—';const m=Math.floor(s/60),sec=(s%60).toFixed(3).padStart(6,'0');return`${m}:${sec}`}
+
+async function get(ep,qs=''){
+  let backoffDelay = 1500; 
+  while(true){
+    try {
+      const r=await fetch(`${API}/${ep}?${qs}`);
+      if(r.status === 429) {
+        console.warn(`Rate Limit Triggered (429) on endpoints: [${ep}]. Cool down active...`);
+        const sub = $('osub');
+        if(sub) sub.textContent = `Server busy (429). Throttling down for ${(backoffDelay/1000).toFixed(1)}s...`;
+        await new Promise(res => setTimeout(res, backoffDelay));
+        backoffDelay = Math.min(backoffDelay * 2, 12000); 
+        continue;
+      }
+      if(!r.ok) throw new Error(r.status);
+      return await r.json();
+    } catch(e) {
+      if(e.message === '429') continue;
+      throw e;
+    }
+  }
+}
+
+function showLoad(t,s){$('otxt').textContent=t;$('osub').textContent=s;$('overlay').classList.remove('h')}
+function hideLoad(){$('overlay').classList.add('h')}
+
+async function init(){
+  const sy=$('sy');
+  sy.add(new Option('2026 Season', 2026));
+  sy.value=2026;
+  sy.addEventListener('change',loadEvents);
+  $('se').addEventListener('change',loadSessions);
+  $('bload').addEventListener('click',loadSession);
+  $('blive').addEventListener('click',toggleLive);
+  $('schart').addEventListener('change',renderChart);
+  $('bprev').addEventListener('click',()=>{if(S.lapIdx>0){S.lapIdx--;renderLap()}});
+  $('bnext').addEventListener('click',()=>{if(S.lapIdx<S.laps.length-1){S.lapIdx++;renderLap()}});
+  $('lapInput').addEventListener('keydown',e=>{
+    if(e.key==='Enter'){
+      const n=parseInt($('lapInput').value);
+      if(!isNaN(n)&&S.laps.length){
+        const idx=S.laps.findIndex(l=>l.lap_number===n);
+        if(idx>=0){S.lapIdx=idx;renderLap();}
+        else{$('lapInput').value=S.laps[S.lapIdx]?.lap_number||'—';}
+      }
+      $('lapInput').blur();
+    }
+    if(e.key==='Escape'){$('lapInput').value=S.laps[S.lapIdx]?.lap_number||'—';$('lapInput').blur();}
+  });
+  $('lapInput').addEventListener('focus',()=>$('lapInput').select());
+
+  // Snapshot button
+  $('snapBtn').addEventListener('click',()=>{
+    const raw=$('snapInput').value.replace('s','').trim();
+    const v=parseFloat(raw);
+    if(isNaN(v)){$('snapInput').style.borderColor='#e8002d';return;}
+    if(!S.telData?.lap?.date_start){$('snapInput').placeholder='load a lap first';return;}
+    $('snapInput').style.borderColor='';
+    triggerSnapshot(v);
+    $('snapBtn').textContent='✓ SNAP';
+    setTimeout(()=>$('snapBtn').textContent='⚡ SNAP',1200);
+  });
+  $('snapInput').addEventListener('keydown',e=>{if(e.key==='Enter')$('snapBtn').click();});
+  $('snapInput').addEventListener('input',()=>$('snapInput').style.borderColor='');
+
+  // Distance normalisation toggle
+  $('distToggle').addEventListener('click',()=>{
+    if(!S.telData2){
+      $('distToggleWrap').title='Load a second driver to use distance normalisation';
+      $('distToggleWrap').style.opacity='0.4';
+      return;
+    }
+    S.distNorm=!S.distNorm;
+    $('distToggle').classList.toggle('on',S.distNorm);
+    if(S.telData)renderChart();
+  });
+  $('distToggleWrap').addEventListener('click',e=>{
+    if(e.target.id!=='distToggle') $('distToggle').click();
+  });
+  
+  $('tscrub').addEventListener('input', function() {
+    if(!S.telData || !S.telData.tel.length) return;
+    S.scrubIdx = parseInt(this.value);
+    updateTelemMetrics(S.telData.tel, S.telData.lap, S.scrubIdx);
+    drawTrack(S.telData.loc, S.telData.tel, S.scrubIdx);
+    updateChartIndicator();
+  });
+
+  // Sector Zoom Handlers
+  $('ms1-btn').addEventListener('click',e=>toggleSector(1,e.shiftKey));
+  $('ms2-btn').addEventListener('click',e=>toggleSector(2,e.shiftKey));
+  $('ms3-btn').addEventListener('click',e=>toggleSector(3,e.shiftKey));
+
+  // Drag-to-Zoom Chart Event Listeners
+  initDragZoom();
+
+  $('bresetzoom').addEventListener('click', () => {
+    S.customZoom = null;
+    $('bresetzoom').style.display = 'none';
+    renderChart();
+    if(S.telData) drawTrack(S.telData.loc, S.telData.tel, S.scrubIdx);
+  });
+
+  document.addEventListener('keydown',e=>{if(e.key==='ArrowLeft')$('bprev').click();if(e.key==='ArrowRight')$('bnext').click()});
+  await loadEvents();
+  hideLoad();
+}
+
+function initDragZoom() {
+  const cw = $('cw');
+  const dBox = $('drag-box');
+  let isDragging = false, startX = 0;
+
+  cw.addEventListener('mousedown', e => {
+    if ($('schart').value === 'laptimes' || !S.telemChart) return;
+    isDragging = true;
+    startX = e.offsetX;
+    dBox.style.left = startX + 'px';
+    dBox.style.width = '0px';
+    dBox.style.display = 'block';
+  });
+
+  cw.addEventListener('mousemove', e => {
+    if (!isDragging) return;
+    const curX = e.offsetX;
+    dBox.style.left = Math.min(startX, curX) + 'px';
+    dBox.style.width = Math.abs(curX - startX) + 'px';
+  });
+
+  document.addEventListener('mouseup', e => {
+    if (!isDragging) return;
+    isDragging = false;
+    dBox.style.display = 'none';
+    
+    // Calculate boundaries relative to chart wrapper
+    const rect = cw.getBoundingClientRect();
+    const endX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+
+    if (Math.abs(endX - startX) > 15 && S.telemChart) {
+      const scale = S.telemChart.scales.x;
+      const v1 = scale.getValueForPixel(startX);
+      const v2 = scale.getValueForPixel(endX);
+      
+      const currentBounds = getActiveBounds();
+      const absStart = currentBounds.start + Math.min(v1, v2);
+      const absEnd = currentBounds.start + Math.max(v1, v2);
+      
+      S.customZoom = { 
+        start: Math.max(currentBounds.start, Math.floor(absStart)), 
+        end: Math.min(currentBounds.end, Math.ceil(absEnd)) 
+      };
+      
+      $('bresetzoom').style.display = 'inline-block';
+      renderChart();
+      if(S.telData) drawTrack(S.telData.loc, S.telData.tel, S.scrubIdx);
+    }
+  });
+}
+
+// Master bounds function resolving Custom Zooms vs Sector Zooms
+function getActiveBounds() {
+  if (!S.telData || !S.telData.tel) return {start:0, end:0};
+  if (S._snapBounds) return S._snapBounds;
+  if (S.customZoom) return S.customZoom;
+  const bounds = getSectorBoundsForLap(S.telData.lap, S.zoomSector, S.zoomSector2);
+  return getFilteredIndices(S.telData.tel, bounds);
+}
+
+function getSectorBoundsForLap(lap, sec, sec2) {
+  if (!sec || !lap || !lap.date_start) return null;
+  const start = new Date(lap.date_start).getTime();
+  const s1 = start + (lap.duration_sector_1 || 0)*1000;
+  const s2 = s1 + (lap.duration_sector_2 || 0)*1000;
+  const s3 = s2 + (lap.duration_sector_3 || 0)*1000;
+  const sectorMap = {1:{t0:start,t1:s1}, 2:{t0:s1,t1:s2}, 3:{t0:s2,t1:s3}};
+  const b1 = sectorMap[sec];
+  if(!sec2 || !sectorMap[sec2]) return b1;
+  const b2 = sectorMap[sec2];
+  // Merge: take the min t0 and max t1 of both sectors
+  return {t0: Math.min(b1.t0, b2.t0), t1: Math.max(b1.t1, b2.t1)};
+}
+
+function getFilteredIndices(dataArr, bounds) {
+  if(!bounds || !dataArr || !dataArr.length) return {start:0, end:dataArr?dataArr.length-1:0};
+  let startIdx = -1, endIdx = -1;
+  for(let i=0; i<dataArr.length; i++){
+    const t = new Date(dataArr[i].date).getTime();
+    if (t >= bounds.t0 && startIdx === -1) startIdx = i;
+    if (t <= bounds.t1) endIdx = i;
+  }
+  if (startIdx === -1) startIdx = 0;
+  if (endIdx === -1) endIdx = dataArr.length - 1;
+  return {start: startIdx, end: endIdx};
+}
+
+function toggleSector(s, shift) {
+  if(shift && S.zoomSector && S.zoomSector !== s){
+    // Shift+click: toggle second sector
+    S.zoomSector2 = (S.zoomSector2 === s) ? null : s;
+  } else {
+    // Normal click: set primary, clear secondary if same
+    if(S.zoomSector === s){ S.zoomSector = null; S.zoomSector2 = null; }
+    else { S.zoomSector = s; S.zoomSector2 = null; }
+  }
+  S.customZoom = null;
+  $('bresetzoom').style.display = 'none';
+  updateSectorBtnStyles();
+  if(S.telData){
+    renderChart();
+    drawTrack(S.telData.loc, S.telData.tel, S.scrubIdx);
+  }
+}
+
+function updateSectorBtnStyles(){
+  [1,2,3].forEach(i=>{
+    const el=$('ms'+i+'-btn');
+    el.classList.toggle('act', i===S.zoomSector);
+    el.classList.toggle('act2', i===S.zoomSector2);
+  });
+}
+
+async function loadEvents(){
+  const y=$('sy').value;
+  const se=$('se'),ss=$('ss');
+  se.innerHTML='<option>Loading…</option>';ss.innerHTML='<option>— select event —</option>';
+  try{
+    const ms=await get('meetings',`year=${y}`);
+    se.innerHTML='';
+    const now = new Date();
+    const pastMeetings = ms.filter(m => new Date(m.date_start) < now);
+    
+    if(!pastMeetings.length) { se.innerHTML='<option>No events scheduled</option>'; return; }
+    pastMeetings.sort((a,b)=>a.meeting_key-b.meeting_key).forEach(m=>se.add(new Option(`${m.meeting_name}`,m.meeting_key)));
+    se.dispatchEvent(new Event('change'));
+  }catch(e){se.innerHTML='<option>Error</option>'}
+}
+
+async function loadSessions(){
+  const mk=$('se').value;
+  const ss=$('ss');
+  if(!mk||isNaN(mk)){ss.innerHTML='<option>— event —</option>';return;}
+  ss.innerHTML='<option>Loading…</option>';
+  try{
+    const sessions=await get('sessions',`meeting_key=${mk}`);
+    ss.innerHTML='';
+    const ord={'Practice 1':1,'Practice 2':2,'Practice 3':3,'Sprint Qualifying':4,'Sprint Shootout':4,'Sprint':5,'Qualifying':6,'Race':7};
+    sessions.sort((a,b)=>(ord[a.session_name]||9)-(ord[b.session_name]||9)).forEach(s=>ss.add(new Option(s.session_name,s.session_key)));
+  }catch(e){ss.innerHTML='<option>Error</option>'}
+}
+
+async function loadSession(){
+  const sk=$('ss').value;
+  if(!sk||isNaN(sk))return;
+  S.sessionKey=sk;S.driverNum=null;S.driverNum2=null;S.laps=[];S.lapIdx=0;
+  S.customZoom=null; S.zoomSector=null; S.zoomSector2=null; S._snapBounds=null; $('bresetzoom').style.display='none';
+  document.querySelectorAll('.sec-btn').forEach(el => {el.classList.remove('act');el.classList.remove('act2');});
+
+  showLoad('Loading session…','Synchronizing driver registers...');
+  try{
+    const drivers = await get('drivers',`session_key=${sk}`);
+    S.drivers={}; drivers.forEach(d=>S.drivers[d.driver_number]=d);
+    await new Promise(r => setTimeout(r, 250));
+
+    showLoad('Loading session…','Parsing complete lap logs...');
+    const laps = await get('laps',`session_key=${sk}`);
+    S.allLaps={}; laps.forEach(l=>{if(!S.allLaps[l.driver_number])S.allLaps[l.driver_number]=[];S.allLaps[l.driver_number].push(l)});
+    await new Promise(r => setTimeout(r, 250));
+
+    showLoad('Loading session…','Extracting compound stints...');
+    const stints = await get('stints',`session_key=${sk}`);
+    S.stints={}; stints.forEach(s=>{if(!S.stints[s.driver_number])S.stints[s.driver_number]=[];S.stints[s.driver_number].push(s)});
+    await new Promise(r => setTimeout(r, 250));
+
+    showLoad('Loading session…','Calculating pit stop arrays...');
+    const pits = await get('pit',`session_key=${sk}`);
+    S.pits={}; pits.forEach(p=>{S.pits[p.driver_number]=(S.pits[p.driver_number]||0)+1});
+    await new Promise(r => setTimeout(r, 250));
+    
+    showLoad('Loading session…','Mapping historic positioning arrays...');
+    let pos=[];
+    try{pos=await get('position',`session_key=${sk}`)}catch(e){}
+    S.positions={};
+    pos.sort((a,b)=>new Date(a.date)-new Date(b.date));
+    pos.forEach(p=>{S.positions[p.driver_number]=p});
+
+    let ivals=[];
+    try{ivals=await get('intervals',`session_key=${sk}`)}catch(e){console.warn('Intervals fetch error:',e);}
+    console.log('[Intervals] raw count:',ivals.length,'sample:',ivals[0]);
+    S.intervals={};
+    ivals.sort((a,b)=>new Date(a.date)-new Date(b.date));
+    ivals.forEach(iv=>{S.intervals[iv.driver_number]=iv;S.intervals[String(iv.driver_number)]=iv;});
+    console.log('[Intervals] stored keys:',Object.keys(S.intervals));
+
+    showLoad('Loading session…','Pulling race control log...');
+    let rc=[];
+    try{rc=await get('race_control',`session_key=${sk}`)}catch(e){console.warn('Race control fetch error:',e);}
+    // Filter to meaningful events only
+    S.raceControl=rc.filter(e=>
+      e.flag==='YELLOW'||e.flag==='RED'||e.flag==='CHEQUERED'||
+      e.safety_car==='DEPLOYED'||e.safety_car==='IN_THIS_LAP'||
+      e.virtual_safety_car==='DEPLOYED'||e.virtual_safety_car==='IN_THIS_LAP'
+    ).sort((a,b)=>new Date(a.date)-new Date(b.date));
+    console.log('[RaceControl] events loaded:',S.raceControl.length);
+    S.rcPins=[];
+
+    const sesInfo=await get('sessions',`session_key=${sk}`).catch(()=>[{}]);
+    const si=sesInfo[0]||{};
+    $('st0').textContent=si.session_name||'—';
+    $('st1').textContent=si.circuit_short_name||si.location||'—';
+    
+    renderDriverList();
+    const first=Object.keys(S.drivers).sort((a,b)=>(S.positions[a]?.position||99)-(S.positions[b]?.position||99))[0];
+    if(first)selectDriver(parseInt(first));
+  }catch(e){alert('Failed initialization: '+e.message)}
+  finally{hideLoad()}
+}
+
+function renderDriverList(){
+  const list=$('dlist');list.innerHTML='';
+  const nums=Object.keys(S.drivers).sort((a,b)=>{
+    return (S.positions[a]?.position||99)-(S.positions[b]?.position||99);
+  });
+  if(!nums.length){list.innerHTML='<div class="empty-msg" style="position:static;padding:20px">No metrics logged for selection</div>';return;}
+  nums.forEach(n=>{
+    const d=S.drivers[n];
+    const color=TC[d.team_name]||'#888';
+    const pos=S.positions[n]?.position||'—';
+    const dlaps=S.allLaps[n]||[];
+    const valid=dlaps.filter(l=>l.lap_duration).sort((a,b)=>a.lap_duration-b.lap_duration);
+    const best=valid[0];
+    const el=document.createElement('div');
+    el.className='dc';el.dataset.n=n;
+    
+    if(S.driverNum===parseInt(n)) el.classList.add('sel');
+    if(S.driverNum2===parseInt(n)) el.classList.add('sel2');
+
+    el.innerHTML=`<div class="dd" style="background:${color}"></div>
+      <div class="dnum">${d.driver_number}</div>
+      <div><div class="dname">${d.name_acronym||'UNK'}</div><div class="dteam" title="Click to overlay team drivers">${d.team_name||'—'}</div></div>
+      <div style="flex:1"></div>
+      <div style="text-align:right"><div class="dlt">${best?fl(best.lap_duration):'—'}</div><div class="dgap">P${pos}</div></div>
+      <div class="dpos" style="background:${pos<=3?'rgba(232,0,45,0.2)':'var(--surface2)'}">${pos}</div>`;
+    
+    el.addEventListener('click',(e)=>selectDriver(parseInt(n), e.shiftKey));
+    
+    // Team Selection Event Listener
+    const teamEl = el.querySelector('.dteam');
+    if(d.team_name) {
+      teamEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        selectTeam(d.team_name);
+      });
+    }
+
+    list.appendChild(el);
+  });
+}
+
+async function selectTeam(teamName) {
+  const teamDrivers = Object.keys(S.drivers).filter(n => S.drivers[n].team_name === teamName);
+  if (teamDrivers.length > 0) {
+    S.driverNum = parseInt(teamDrivers[0]);
+    document.querySelectorAll('.dc').forEach(c => {
+      c.classList.remove('sel', 'sel2');
+      if (parseInt(c.dataset.n) === S.driverNum) c.classList.add('sel');
+    });
+
+    const d = S.drivers[S.driverNum];
+    $('st4').textContent = d.name_acronym || '—';
+    S.laps = (S.allLaps[S.driverNum] || []).sort((a,b) => a.lap_number - b.lap_number);
+    S.lapIdx = 0; // Initialize at Lap 1
+    updateTiming(S.driverNum); 
+    updateTyre(S.driverNum);
+
+    if (teamDrivers.length > 1) {
+      S.driverNum2 = parseInt(teamDrivers[1]);
+      document.querySelectorAll('.dc').forEach(c => {
+        if (parseInt(c.dataset.n) === S.driverNum2) c.classList.add('sel2');
+      });
+      // Render lap without removing D2 selection
+      await renderLap(true); 
+      await loadSecondDriver();
+    } else {
+      S.driverNum2 = null; S.telData2 = null; S.distNorm=false; $('distToggle').classList.remove('on'); $('distToggleWrap').style.opacity='0.4';
+      await renderLap();
+    }
+  }
+}
+
+async function selectDriver(num, isShift = false){
+  if (isShift && S.driverNum) {
+    if (S.driverNum === num) return; 
+    S.driverNum2 = num;
+    document.querySelectorAll('.dc').forEach(c=>c.classList.toggle('sel2',parseInt(c.dataset.n)===num));
+    await loadSecondDriver();
+    return;
+  }
+
+  S.driverNum = num; S.driverNum2 = null; S.telData2 = null;
+  document.querySelectorAll('.dc').forEach(c=>{
+    c.classList.toggle('sel',parseInt(c.dataset.n)===num);
+    c.classList.remove('sel2');
+  });
+
+  const d=S.drivers[num];if(!d)return;
+  $('st4').textContent=d.name_acronym||'—';
+  S.laps=(S.allLaps[num]||[]).sort((a,b)=>a.lap_number-b.lap_number);
+  S.lapIdx = 0; // Initialize at Lap 1
+  updateTiming(num);updateTyre(num);
+  renderLap();
+}
+
+async function loadSecondDriver() {
+  const dlaps = S.allLaps[S.driverNum2] || [];
+  const valid = dlaps.filter(l=>l.lap_duration).sort((a,b)=>a.lap_duration-b.lap_duration);
+  const best = valid[0];
+  if(!best) return;
+
+  showLoad('Loading overlay...', `Fetching Best Lap for Driver ${S.driverNum2}`);
+  try {
+    const startTime = best.date_start;
+    const startMs = new Date(startTime).getTime();
+    const duration = best.lap_duration || 90;
+    const endTime = new Date(startMs + (duration * 1000)).toISOString();
+
+    const tel = await get('car_data',`session_key=${S.sessionKey}&driver_number=${S.driverNum2}&date>=${startTime}&date<=${endTime}`);
+    const loc = await get('location',`session_key=${S.sessionKey}&driver_number=${S.driverNum2}&date>=${startTime}&date<=${endTime}`);
+
+    S.telData2 = {tel, loc, lap: best};
+    // Re-enable dist norm toggle now that D2 is loaded
+    $('distToggleWrap').style.opacity='1';
+    $('distToggleWrap').title='Align drivers by distance instead of time';
+    if(S.telData) {
+      renderChart();
+      drawTrack(S.telData.loc, S.telData.tel, S.scrubIdx);
+    }
+  } catch(e) { console.error(e); } 
+  finally { hideLoad(); }
+}
+
+async function renderLap(keepD2 = false){
+  if(!keepD2 && !S.driverNum2) { S.telData2 = null; }
+
+  if(!S.driverNum||!S.laps.length){
+    $('tempty').style.display='flex';
+    $('tempty').textContent='No timeline history found';
+    return;
+  }
+  
+  // Ensure lapIdx is within bounds after potentially trimming the array
+  if(S.lapIdx >= S.laps.length) S.lapIdx = Math.max(0, S.laps.length - 1);
+  const lap=S.laps[S.lapIdx];
+  $('st2').textContent=lap.lap_number;
+  $('lapInput').value=lap.lap_number;$('lapTotal').textContent=' / '+(S.laps.slice(-1)[0]?.lap_number||'?');
+
+  const startTime = lap.date_start;
+  if (!startTime) {
+    $('tempty').style.display='flex';
+    $('tempty').textContent='No timing sequence available for this lap';
+    return;
+  }
+
+  const startMs = new Date(startTime).getTime();
+  const duration = lap.lap_duration || 90;
+  const endTime = new Date(startMs + (duration * 1000)).toISOString();
+
+  showLoad('Loading telemetry…',`Pulling car telemetry for Lap ${lap.lap_number}`);
+  try{
+    const tel = await get('car_data',`session_key=${S.sessionKey}&driver_number=${S.driverNum}&date>=${startTime}&date<=${endTime}`);
+    showLoad('Loading telemetry…',`Pulling track coordinate matrices...`);
+    const loc = await get('location',`session_key=${S.sessionKey}&driver_number=${S.driverNum}&date>=${startTime}&date<=${endTime}`);
+
+    S.telData={tel,loc,lap};
+
+    if(tel && tel.length > 0){
+      S.scrubIdx = tel.length - 1;
+      $('tscrub').max = tel.length - 1;
+      $('tscrub').value = S.scrubIdx;
+    } else {
+      S.scrubIdx = 0; $('tscrub').max = 0; $('tscrub').value = 0;
+    }
+
+    // Hide overlay — data is loaded regardless of chart render success
+    $('tempty').style.display='none';
+    updateTelemMetrics(tel, lap, S.scrubIdx);
+    drawTrack(loc, tel, S.scrubIdx);
+    $('st5').textContent=new Date().toLocaleTimeString();
+    renderLapTable();
+
+    // Chart render is isolated — a failure here won't blank the track
+    try{ renderChart(); }catch(ce){
+      console.warn('Chart render failed for this lap:',ce);
+    }
+  }catch(e){
+    console.error('Telemetry load error:',e);
+    // Only show error if we have no prior data to display
+    if(!S.telData?.loc?.length){
+      $('tempty').style.display='flex';
+      $('tempty').textContent='No telemetry available for this lap';
+    }
+  }finally{hideLoad()}
+}
+
+function updateTelemMetrics(tel,lap,idx){
+  if(!tel||!tel.length) return;
+  const frame = tel[idx] || tel[tel.length - 1];
+  const topSpd = Math.max(...tel.map(t=>t.speed||0));
+  
+  $('ms').textContent=frame.speed!=null?frame.speed:'—';
+  $('mts').textContent=topSpd>0?topSpd:'—';
+  $('mt').textContent=frame.throttle!=null?Math.round(frame.throttle):'—';
+  const aeroOn=frame.drs>0;
+  $('mb').className=aeroOn?'drs-on':'drs-off';
+  $('mb').textContent=aeroOn?'ON':'OFF';
+  $('mg2').textContent=frame.n_gear!=null?frame.n_gear:'—';
+  $('mrpm').textContent=frame.rpm?Math.round(frame.rpm/100)/10+'k':'—';
+  
+  const on=frame.drs>0;
+  $('mdrs').className=on?'drs-on':'drs-off';
+  $('mdrs').textContent=on?'ON':'OFF';
+  
+  $('ms1').textContent=lap.duration_sector_1?lap.duration_sector_1.toFixed(3):'—';
+  $('ms2').textContent=lap.duration_sector_2?lap.duration_sector_2.toFixed(3):'—';
+  $('ms3').textContent=lap.duration_sector_3?lap.duration_sector_3.toFixed(3):'—';
+
+  if(lap.date_start && frame.date) {
+    const elapsed = (new Date(frame.date).getTime() - new Date(lap.date_start).getTime()) / 1000;
+    $('tscrub-val').textContent = elapsed >= 0 ? elapsed.toFixed(1) + 's' : '00.0s';
+  }
+}
+
+function updateTiming(num){
+  const laps=S.laps;
+  const valid=laps.filter(l=>l.lap_duration).sort((a,b)=>a.lap_duration-b.lap_duration);
+  const best=valid[0];const last=laps.slice(-1)[0];
+  $('mll').textContent=last?fl(last.lap_duration):'—';
+  $('mbl').textContent=best?fl(best.lap_duration):'—';
+  $('mpos').textContent='P'+(S.positions[num]?.position||'—');
+  $('mps').textContent=S.pits[num]||0;
+  const lead=Object.entries(S.positions).find(([,p])=>p.position===1);
+  $('st3').textContent=lead?S.drivers[lead[0]]?.name_acronym||'—':'—';
+  // Coerce num to match whatever type the API returned (string or number)
+  const ivEntry=S.intervals[num]||S.intervals[+num]||S.intervals[String(num)];
+  if(!ivEntry){
+    $('mgap').textContent='—';
+  } else {
+    const gapVal=ivEntry.gap_to_leader;
+    if(gapVal===null||gapVal===undefined||gapVal===0||gapVal===''){
+      $('mgap').textContent='LEADER';
+    } else {
+      $('mgap').textContent='+'+Number(gapVal).toFixed(3)+'s';
+    }
+  }
+}
+
+function updateTyre(num){
+  const stints=(S.stints[num]||[]).sort((a,b)=>b.stint_number-a.stint_number);
+  const cur=stints[0];if(!cur)return;
+  const cmpd=(cur.compound||'UNK').toUpperCase();
+  const age=(cur.tyre_age_at_start||0)+((S.laps.length)-(cur.lap_start||1));
+  const pct=Math.min(100,(age/55)*100);
+  const col=TY[cmpd]||'#888';
+  const bar=pct<50?'#00e676':pct<75?'#ff8700':'#e8002d';
+  $('tcirc').textContent=cmpd[0]||'?';
+  $('tcirc').style.background=col+'20';
+  $('tcirc').style.borderColor=col;
+  $('tcirc').style.color=col;
+  $('tcmpd').textContent=cmpd;$('tcmpd').style.color=col;
+  $('tbar').style.width=pct+'%';$('tbar').style.background=bar;
+  $('tage').textContent=`${Math.round(pct)}% used · ${pct<50?'In window':pct<75?'Degrading':'High Wear'}`;
+  $('mta').textContent=age;
+}
+
+function drawTrack(loc,tel,idx){
+  const canvas=$('tcanv');const wrap=$('tmap');
+  canvas.width=wrap.clientWidth;canvas.height=wrap.clientHeight;
+  const ctx=canvas.getContext('2d');
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if(!loc||!loc.length)return;
+  
+  const tf = getActiveBounds();
+  // Register transforms for track-hover feature (after bounds computed)
+  const zxs = loc.slice(tf.start, tf.end+1).map(p=>p.x);
+  const zys = loc.slice(tf.start, tf.end+1).map(p=>p.y);
+
+  const mn=Math.min,mx=Math.max;
+  const minX=mn(...(zxs.length?zxs:loc.map(p=>p.x)));
+  const maxX=mx(...(zxs.length?zxs:loc.map(p=>p.x)));
+  const minY=mn(...(zys.length?zys:loc.map(p=>p.y)));
+  const maxY=mx(...(zys.length?zys:loc.map(p=>p.y)));
+
+  const pad=22,W=canvas.width-pad*2,H=canvas.height-pad*2;
+  const sx=W/(maxX-minX||1),sy=H/(maxY-minY||1),sc=mn(sx,sy);
+  const ox=pad+(W-(maxX-minX)*sc)/2,oy=pad+(H-(maxY-minY)*sc)/2;
+  const tx=x=>ox+(x-minX)*sc;
+  const ty=y=>canvas.height-(oy+(y-minY)*sc);
+  if(window._registerTrackTransform) _registerTrackTransform(loc,tel,tx,ty);
+  
+  const spds=tel?tel.map(t=>t.speed||0):[];
+  const maxS=spds.length?mx(...spds):300,minS=spds.length?mn(...spds):0;
+
+  ctx.beginPath();
+  ctx.moveTo(tx(loc[0].x),ty(loc[0].y));
+  for(let i=1;i<loc.length;i++)ctx.lineTo(tx(loc[i].x),ty(loc[i].y));
+  ctx.strokeStyle='rgba(42,42,64,0.4)';ctx.lineWidth=12;ctx.lineJoin='round';ctx.lineCap='round';ctx.stroke();
+
+  if(spds.length){
+    for(let i=tf.start; i<Math.min(tf.end, loc.length-1); i++){
+      const spdVal = spds[i] !== undefined ? spds[i] : (spds[spds.length-1]||0);
+      const t=(spdVal-minS)/(maxS-minS||1);
+      ctx.beginPath();ctx.moveTo(tx(loc[i].x),ty(loc[i].y));ctx.lineTo(tx(loc[i+1].x),ty(loc[i+1].y));
+      ctx.strokeStyle=spdCol(t);ctx.lineWidth=5;ctx.lineJoin='round';ctx.lineCap='round';ctx.stroke();
+    }
+  }
+
+  let activeLocIdx = loc.length - 1;
+  if (tel && tel[idx]) {
+    const targetTime = new Date(tel[idx].date).getTime();
+    let minDiff = Infinity;
+    for (let i = 0; i < loc.length; i++) {
+      const diff = Math.abs(new Date(loc[i].date).getTime() - targetTime);
+      if (diff < minDiff) { minDiff = diff; activeLocIdx = i; }
+    }
+  }
+  const d=S.drivers[S.driverNum];
+  const col=d?TC[d.team_name]||'#fff':'#fff';
+  const lx=tx(loc[activeLocIdx].x),ly=ty(loc[activeLocIdx].y);
+  
+  ctx.beginPath();ctx.arc(lx,ly,8,0,Math.PI*2);ctx.fillStyle=col;ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();
+  ctx.font='bold 10px monospace';ctx.fillStyle='#fff';ctx.textAlign='center';
+  ctx.fillText(d?d.name_acronym||'':'',lx,ly-13);
+
+  if (S.telData2 && S.telData2.loc && S.telData2.tel && S.telData2.tel.length) {
+    const pct = tel.length ? Math.max(0, Math.min(1, idx / tel.length)) : 0;
+    const t2Idx = Math.floor(pct * S.telData2.tel.length);
+    const frame2 = S.telData2.tel[Math.min(t2Idx, S.telData2.tel.length-1)];
+    
+    if (frame2) {
+       const targetTime2 = new Date(frame2.date).getTime();
+       let minDiff2 = Infinity, activeLocIdx2 = 0;
+       for(let i=0; i<S.telData2.loc.length; i++){
+         const diff = Math.abs(new Date(S.telData2.loc[i].date).getTime() - targetTime2);
+         if (diff < minDiff2) { minDiff2 = diff; activeLocIdx2 = i; }
+       }
+       const d2 = S.drivers[S.driverNum2];
+       const col2 = d2 ? TC[d2.team_name]||'#fff' : '#fff';
+       const p2 = S.telData2.loc[activeLocIdx2];
+       if (p2) {
+         const lx2 = tx(p2.x), ly2 = ty(p2.y);
+         ctx.beginPath();ctx.arc(lx2,ly2,8,0,Math.PI*2);ctx.fillStyle=col2;ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();
+         ctx.fillText(d2?d2.name_acronym||'':'',lx2,ly2-13);
+       }
+    }
+  }
+
+  // ── Incident pins ────────────────────────────────────────────────────────
+  S.rcPins=[];
+  if(S.raceControl&&S.raceControl.length&&loc&&loc.length){
+    // Only show events that actually occurred during this lap's time window
+    const lapStartMs=new Date(loc[0].date).getTime();
+    const lapEndMs=new Date(loc[loc.length-1].date).getTime();
+    const buffer=10000; // 10s grace either side for flag deployment timing
+
+    const usedBuckets=new Set();
+
+    S.raceControl.forEach(ev=>{
+      const evMs=new Date(ev.date).getTime();
+
+      // Skip anything outside this lap's window
+      if(evMs<lapStartMs-buffer||evMs>lapEndMs+buffer)return;
+
+      // Find closest loc point by timestamp
+      let locIdx=0,bestD=Infinity;
+      for(let i=0;i<loc.length;i++){
+        const d=Math.abs(new Date(loc[i].date).getTime()-evMs);
+        if(d<bestD){bestD=d;locIdx=i;}
+      }
+
+      // Deduplicate — don't stack same event type at the same position
+      const bucket=Math.round(locIdx/8);
+      const key=bucket+'|'+(ev.flag||ev.safety_car||ev.virtual_safety_car||'msg');
+      if(usedBuckets.has(key))return;
+      usedBuckets.add(key);
+
+      const px=tx(loc[locIdx].x), py=ty(loc[locIdx].y);
+
+      // Pick colour + label by structured fields only (no free-text matching)
+      let fill='#ffcc00',stroke='#000',label='YF',textCol='#000';
+      if(ev.flag==='RED'){fill='#e8002d';stroke='#fff';label='RF';textCol='#fff';}
+      else if(ev.safety_car==='DEPLOYED'||ev.safety_car==='IN_THIS_LAP'){fill='#fff';stroke='#222';label='SC';textCol='#111';}
+      else if(ev.virtual_safety_car==='DEPLOYED'||ev.virtual_safety_car==='IN_THIS_LAP'){fill='#00cfff';stroke='#000';label='VSC';textCol='#000';}
+      else if(ev.flag==='CHEQUERED'){fill='#fff';stroke='#000';label='✓';textCol='#000';}
+      else if(ev.flag!=='YELLOW'){return;} // skip anything unrecognised
+
+      // Store pin for hit-testing
+      S.rcPins.push({px,py,ev,fill,label,textCol});
+
+      // Draw pin
+      ctx.beginPath();ctx.arc(px,py,10,0,Math.PI*2);
+      ctx.fillStyle=fill;ctx.fill();
+      ctx.strokeStyle=stroke;ctx.lineWidth=1.5;ctx.stroke();
+      ctx.font='bold 8px monospace';ctx.fillStyle=textCol;ctx.textAlign='center';ctx.textBaseline='middle';
+      ctx.fillText(label,px,py);
+      ctx.textBaseline='alphabetic';
+    });
+  }
+
+  const gx=canvas.width-90,gy=canvas.height-14,gw=80,gh=6;
+  const g=ctx.createLinearGradient(gx,0,gx+gw,0);
+  g.addColorStop(0,'#1565c0');g.addColorStop(0.5,'#7b1fa2');g.addColorStop(1,'#ff8700');
+  ctx.fillStyle=g;ctx.fillRect(gx,gy,gw,gh);
+  ctx.fillStyle='rgba(255,255,255,0.5)';ctx.font='8px monospace';ctx.textAlign='left';
+  ctx.fillText(Math.round(minS),gx,gy-2);ctx.textAlign='right';ctx.fillText(Math.round(maxS),gx+gw,gy-2);
+
+  // Pin legend (bottom left)
+  if(S.raceControl&&S.raceControl.length){
+    const items=[{c:'#ffcc00',tc:'#000',l:'YF  Yellow'},{c:'#e8002d',tc:'#fff',l:'!  Incident'},{c:'#00cfff',tc:'#000',l:'VSC'},{c:'#fff',tc:'#111',l:'SC'}];
+    let lx2=8;
+    items.forEach(item=>{
+      ctx.beginPath();ctx.arc(lx2+6,gy,5,0,Math.PI*2);ctx.fillStyle=item.c;ctx.fill();ctx.strokeStyle='rgba(255,255,255,0.3)';ctx.lineWidth=0.5;ctx.stroke();
+      ctx.font='7px monospace';ctx.fillStyle='rgba(255,255,255,0.5)';ctx.textAlign='left';
+      ctx.fillText(item.l,lx2+14,gy+3);
+      lx2+=ctx.measureText(item.l).width+22;
+    });
+  }
+}
+
+function spdCol(t){
+  const r=Math.round(21+t*234),g=Math.round(101-t*90),b=Math.round(192-t*192);
+  return `rgb(${r},${g},${b})`;
+}
+
+const customScrubberPlugin = {
+  id: 'customScrubber',
+  afterDraw: (chart) => {
+    if (chart.config.type === 'bar' || !S.telData) return;
+    const f = getActiveBounds();
+    const ctx = chart.ctx;
+    const topY = chart.scales.y.top;
+    const bottomY = chart.scales.y.bottom;
+
+    // Scrubber line (white)
+    const localIdx = S.scrubIdx - f.start;
+    if (localIdx >= 0 && localIdx < chart.data.labels.length) {
+      const x = chart.scales.x.getPixelForValue(localIdx);
+      ctx.save();
+      ctx.beginPath(); ctx.moveTo(x, topY); ctx.lineTo(x, bottomY);
+      ctx.lineWidth = 1.5; ctx.strokeStyle = '#ffffff88'; ctx.stroke();
+      ctx.restore();
+    }
+
+    // Hover line (cyan dashed)
+    if (S.hoverIdx >= 0) {
+      const hLocal = S.hoverIdx - f.start;
+      if (hLocal >= 0 && hLocal < chart.data.labels.length) {
+        const hx = chart.scales.x.getPixelForValue(hLocal);
+        ctx.save();
+        ctx.setLineDash([3,3]);
+        ctx.beginPath(); ctx.moveTo(hx, topY); ctx.lineTo(hx, bottomY);
+        ctx.lineWidth = 1.5; ctx.strokeStyle = '#00cfff'; ctx.stroke();
+        ctx.restore();
+      }
+    }
+  }
+};
+
+function renderChart(){
+  const mode=$('schart').value;
+  
+  const titles={speed:'Speed Trace',throttle:'Throttle Trace',brake:'Brake Pressure Map',gear:'Gear Range',rpm:'RPM Graph',laptimes:'Historical Laps Trace'};
+  $('ctitle').textContent=titles[mode]||mode;
+  
+  const canvas=$('tchart');
+  if(S.telemChart){S.telemChart.destroy();S.telemChart=null}
+  
+  let labels=[], datasets=[], color='#00cfff', ctype='line';
+  const scales = {
+    x:{display:false},
+    y:{type:'linear',position:'left',grid:{color:'#1e1e35'},ticks:{color:'#6a6a88',font:{size:9,family:'monospace'}}}
+  };
+
+  if(mode==='laptimes'){
+    const vl=S.laps.filter(l=>l.lap_duration);
+    labels=vl.map(l=>`L${l.lap_number}`);
+    datasets=[{
+      label: (S.drivers[S.driverNum]?.name_acronym||'D1')+' '+S.driverNum, data: vl.map(l=>parseFloat(l.lap_duration.toFixed(3))),
+      borderColor: '#00cfff', backgroundColor: 'transparent', borderWidth: 1.5,
+      pointRadius: 0, tension: 0.15, fill: false
+    }];
+  } else {
+    const tel=S.telData?.tel; if(!tel?.length) return;
+    const cols={speed:'#00cfff',throttle:'#00e676',brake:'#e8002d',gear:'#ffcc00',rpm:'#ff8700'};
+    const keys={speed:'speed',throttle:'throttle',brake:'brake',gear:'n_gear',rpm:'rpm'};
+    color=cols[mode];
+    if(mode==='gear') ctype='bar';
+
+    const tf = getActiveBounds();
+    
+    const extractVal=(t,m)=>{
+      const v=t[keys[m]];
+      if(m==='brake')return v?100:0;
+      if(m==='rpm')return v?Math.round(v/100)/10:0;
+      if(m==='gear')return v||0;
+      return v!=null?Math.round(v):0;
+    };
+
+    let d1Sliced, d2Sliced=null, maxLen;
+    const tName2 = S.driverNum2 ? S.drivers[S.driverNum2]?.team_name : null;
+    const col2 = tName2 ? (TC[tName2]||'#ff8700') : '#ff8700';
+
+    if(S.distNorm && S.telData2 && S.telData2.tel?.length){
+      // ── Distance-normalised mode ──────────────────────────────────────
+      try{
+        const tel2=S.telData2.tel;
+        const dist1=buildDistArray(tel);
+        const dist2=buildDistArray(tel2);
+        const maxD=Math.min(dist1[dist1.length-1],dist2[dist2.length-1]);
+        if(!maxD||isNaN(maxD))throw new Error('Zero/NaN distance');
+        const N=500;
+        const targetDist=Array.from({length:N},(_,i)=>i*maxD/(N-1));
+        const r1=resampleByDistance(tel,dist1,targetDist);
+        const r2=resampleByDistance(tel2,dist2,targetDist);
+        d1Sliced=r1.map(t=>extractVal(t,mode));
+        d2Sliced=r2.map(t=>extractVal(t,mode));
+        // Sanity check — all NaN means bad data
+        if(d1Sliced.every(v=>isNaN(v)||v===0))throw new Error('All-zero d1');
+        maxLen=N;
+        labels=targetDist.map(d=>(d/1000).toFixed(2));
+        scales.x={display:true,ticks:{color:'#6a6a88',font:{size:8,family:'monospace'},maxTicksLimit:8},
+                  grid:{color:'#1e1e35'},title:{display:true,text:'Distance (km)',color:'#6a6a88',font:{size:9}}};
+      }catch(err){
+        console.warn('Dist norm failed, falling back to time-based:',err);
+        S.distNorm=false;$('distToggle').classList.remove('on');
+        // fall through to time-based below
+        d1Sliced=tel.slice(tf.start,tf.end+1).map(t=>extractVal(t,mode));
+        if(S.telData2){
+          const fb2=getSectorBoundsForLap(S.telData2.lap,S.zoomSector,S.zoomSector2);
+          const ftf2=getFilteredIndices(S.telData2.tel,fb2);
+          d2Sliced=S.telData2.tel.slice(ftf2.start,ftf2.end+1).map(t=>extractVal(t,mode));
+        }
+        maxLen=Math.max(d1Sliced.length,d2Sliced?d2Sliced.length:0);
+        labels=Array.from({length:maxLen},(_,i)=>i);
+      }
+    } else {
+      // ── Time-based mode (default) ─────────────────────────────────────
+      d1Sliced=tel.slice(tf.start,tf.end+1).map(t=>extractVal(t,mode));
+      if(S.telData2){
+        const d2Bounds=getSectorBoundsForLap(S.telData2.lap,S.zoomSector,S.zoomSector2);
+        const tf2=getFilteredIndices(S.telData2.tel,d2Bounds);
+        d2Sliced=S.telData2.tel.slice(tf2.start,tf2.end+1).map(t=>extractVal(t,mode));
+      }
+      maxLen=Math.max(d1Sliced.length,d2Sliced?d2Sliced.length:0);
+      labels=Array.from({length:maxLen},(_,i)=>i);
+    }
+
+    datasets.push({
+      label:(S.drivers[S.driverNum]?.name_acronym||'D1')+' '+S.driverNum, data:d1Sliced, borderColor:color,
+      backgroundColor:ctype==='bar'?color+'88':color+'18',
+      borderWidth:ctype==='bar'?0:1.5, pointRadius:0, tension:0.15,
+      fill:ctype!=='bar', barPercentage:1, categoryPercentage:1, yAxisID:'y'
+    });
+
+    if(d2Sliced){
+      datasets.push({
+        label:(S.drivers[S.driverNum2]?.name_acronym||'D2')+' '+S.driverNum2, data:d2Sliced, borderColor:col2,
+        backgroundColor:'transparent', borderWidth:1.5,
+        pointRadius:0, tension:0.15, fill:false, yAxisID:'y'
+      });
+    }
+  }
+
+  S.telemChart=new Chart(canvas,{
+    type: ctype,
+    data: {labels, datasets},
+    plugins: [customScrubberPlugin],
+    options: {
+      responsive:true, maintainAspectRatio:false, animation:false,
+      interaction: { mode: 'index', intersect: false },
+      onHover: (e, elements) => {
+         if (elements.length && S.telData && mode !== 'laptimes') {
+           const idx = elements[0].index;
+           const f = getActiveBounds();
+           const realIdx = Math.min(f.start + idx, S.telData.tel.length - 1);
+           
+           $('tscrub').value = realIdx;
+           S.scrubIdx = realIdx;
+           updateTelemMetrics(S.telData.tel, S.telData.lap, realIdx);
+           drawTrack(S.telData.loc, S.telData.tel, realIdx);
+           updateChartIndicator();
+         }
+      },
+      plugins: {
+        legend:{display:false},
+        tooltip:{callbacks:{label:c=>`${c.dataset.label}: ${c.parsed.y}`}}
+      },
+      scales: scales
+    }
+  });
+  updateChartIndicator();
+}
+
+function updateChartIndicator() {
+  if(S.telemChart) S.telemChart.update('none');
+}
+
+function renderLapTable(){
+  const wrap=$('ltable');
+  const laps=S.laps;if(!laps.length){wrap.innerHTML='<div style="padding:10px;color:var(--muted);font-size:10px">No Lap Data</div>';return}
+  const valid=laps.filter(l=>l.lap_duration).map(l=>l.lap_duration);
+  const best=valid.length?Math.min(...valid):null;
+  const cur=S.laps[S.lapIdx];
+  let html='<table><thead><tr><th>Lap</th><th>Lap Time</th><th>S1</th><th>S2</th><th>S3</th><th>Compound</th></tr></thead><tbody>';
+  laps.slice().reverse().forEach(l=>{
+    const iB=best&&l.lap_duration===best,isC=l===cur;
+    const cmpd=(l.compound||'').toUpperCase();
+    const tc=TY[cmpd]||'#888';
+    html+=`<tr class="${iB?'best':''} ${isC?'cur':''}">
+      <td>${l.lap_number}</td>
+      <td style="color:${iB?'var(--green)':'var(--cyan)'}">${fl(l.lap_duration)}</td>
+      <td style="color:var(--muted)">${l.duration_sector_1?l.duration_sector_1.toFixed(3):'—'}</td>
+      <td style="color:var(--muted)">${l.duration_sector_2?l.duration_sector_2.toFixed(3):'—'}</td>
+      <td style="color:var(--muted)">${l.duration_sector_3?l.duration_sector_3.toFixed(3):'—'}</td>
+      <td style="color:${tc};font-size:9px">${cmpd||'—'}</td>
+    </tr>`;
+  });
+  html+='</tbody></table>';
+  wrap.innerHTML=html;
+}
+
+function toggleLive(){
+  S.isLive=!S.isLive;
+  $('blive').classList.toggle('on',S.isLive);
+  if(S.isLive){S.liveInt=setInterval(liveRefresh, 7000);liveRefresh()}
+  else{clearInterval(S.liveInt)}
+}
+
+async function liveRefresh(){
+  if(!S.sessionKey||!S.driverNum)return;
+  try{
+    const laps = await get('laps',`session_key=${S.sessionKey}&driver_number=${S.driverNum}`);
+    if(laps && laps.length){
+      S.laps=laps.sort((a,b)=>a.lap_number-b.lap_number);
+      // Removed the snap-to-end logic to preserve custom lap view
+    }
+    
+    await new Promise(r => setTimeout(r, 400));
+    
+    const pos = await get('position',`session_key=${S.sessionKey}`).catch(()=>[]);
+    if(pos && pos.length){
+      pos.sort((a,b)=>new Date(a.date)-new Date(b.date));
+      pos.forEach(p=>{S.positions[p.driver_number]=p});
+    }
+
+    const ivals = await get('intervals',`session_key=${S.sessionKey}`).catch(()=>[]);
+    if(ivals && ivals.length){
+      ivals.sort((a,b)=>new Date(a.date)-new Date(b.date));
+      ivals.forEach(iv=>{S.intervals[iv.driver_number]=iv;S.intervals[String(iv.driver_number)]=iv;});
+    }
+    
+    updateTiming(S.driverNum);updateTyre(S.driverNum);renderDriverList();renderLap(true);
+    $('st5').textContent=new Date().toLocaleTimeString();
+  }catch(e){console.error('Refresh interval rate block handled safely:',e)}
+}
+
+window.addEventListener('DOMContentLoaded',init);
+window.addEventListener('resize',()=>{
+  if(S.telData) drawTrack(S.telData.loc,S.telData.tel,S.scrubIdx);
+});
+</script>
+</body>
+</html>
